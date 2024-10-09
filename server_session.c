@@ -148,7 +148,7 @@ server_msg_tcp_acceptor(struct session_state *self, struct kpm_header *req)
 	struct epoll_event ev = {};
 	struct sockaddr_in6 addr;
 	socklen_t len;
-	int ret;
+	int ret, val;
 
 	if (self->tcp_sock) {
 		kpm_reply_error(self->main_sock, req, EBUSY);
@@ -169,6 +169,10 @@ server_msg_tcp_acceptor(struct session_state *self, struct kpm_header *req)
 		self->quit = 1;
 		return;
 	}
+
+	val = 1;
+	setsockopt(self->tcp_sock, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
+	setsockopt(self->tcp_sock, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
 	ret = bind(self->tcp_sock, (void *)&addr, sizeof(addr));
 	if (ret < 0) {
@@ -215,7 +219,7 @@ server_msg_connect(struct session_state *self, struct kpm_header *hdr)
 	struct kpm_connect *req;
 	struct connection *conn;
 	socklen_t len;
-	int ret, cfd;
+	int ret, cfd, val;
 
 	if (hdr->len < sizeof(struct kpm_connect)) {
 		warn("Invalid request in %s", __func__);
@@ -236,6 +240,10 @@ server_msg_connect(struct session_state *self, struct kpm_header *hdr)
 		warn("Failed to open socket");
 		goto err_free;
 	}
+
+	val = 1;
+	setsockopt(cfd, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
+	setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
 	if (req->mss &&
 	    setsockopt(cfd, IPPROTO_TCP, TCP_MAXSEG,
