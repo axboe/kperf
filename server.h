@@ -13,6 +13,7 @@
 struct iou_opts {
 	bool enable;
 	bool zcrx;
+	bool send_zc;
 	char *dev_name;
 	unsigned long zcrx_rq_entries;
 	unsigned long zcrx_pages;

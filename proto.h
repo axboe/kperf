@@ -44,6 +44,8 @@ enum kpm_iou_req_type {
 	KPM_IOU_REQ_TYPE_MAIN	= 1,
 	KPM_IOU_REQ_TYPE_READ	= 2,
 	KPM_IOU_REQ_TYPE_RECVZC	= 3,
+	KPM_IOU_REQ_TYPE_SEND	= 4,
+	KPM_IOU_REQ_TYPE_SEND_ZC	= 5,
 };
 
 struct kpm_header {

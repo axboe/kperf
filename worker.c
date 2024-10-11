@@ -39,6 +39,8 @@ struct iou_zcrx {
 	unsigned int ifindex;
 };
 
+#define IOU_PENDING_SENDS	16
+
 /* Main worker state AKA self */
 struct worker_state {
 	int main_sock;
@@ -55,6 +57,8 @@ struct worker_state {
 	struct iou_opts iou_opts;
 	struct io_uring ring;
 	struct iou_zcrx iou_zcrx;
+
+	int iou_sends;
 
 	int (*prep)(struct worker_state *);
 	void (*wait)(struct worker_state *);
@@ -95,8 +99,8 @@ struct kpm_state {
 };
 
 #define PATTERN_PERIOD 255
-static unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
-
+#define PATBUF_SZ	(KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1)
+static unsigned char *patbuf;
 
 static struct connection *
 worker_find_connection_by_fd(struct worker_state *self, int fd)
@@ -597,6 +601,42 @@ kill_conn:
 	worker_kill_conn(self, conn);
 }
 
+static void __worker_iou_send(struct worker_state *self, struct connection *conn)
+{
+	struct io_uring_sqe *sqe;
+	void *src = &patbuf[conn->tot_sent % PATTERN_PERIOD];
+	size_t chunk;
+
+	chunk = min_t(size_t, conn->write_size, conn->to_send);
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_send(sqe, conn->fd, src, chunk, MSG_WAITALL);
+	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_SEND));
+}
+
+static void worker_iou_send_zc(struct worker_state *self, struct connection *conn)
+{
+	struct io_uring_sqe *sqe;
+	void *src = patbuf;
+	size_t chunk;
+
+	chunk = min_t(size_t, conn->write_size, conn->to_send);
+	sqe = io_uring_get_sqe(&self->ring);
+	io_uring_prep_send_zc_fixed(sqe, conn->fd, src, chunk, MSG_WAITALL, 0, IORING_RECVSEND_FIXED_BUF);
+	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_SEND_ZC));
+}
+
+static void worker_iou_send(struct worker_state *self, struct connection *conn,
+			    unsigned int events)
+{
+	while (self->iou_sends < IOU_PENDING_SENDS) {
+		if (self->iou_opts.send_zc)
+			worker_iou_send_zc(self, conn);
+		else
+			__worker_iou_send(self, conn);
+		self->iou_sends++;
+	}
+}
+
 static void
 worker_handle_send(struct worker_state *self, struct connection *conn,
 		   unsigned int events)
@@ -976,6 +1016,36 @@ static void worker_iou_add_recv(struct io_uring *ring, struct connection *conn)
 	io_uring_sqe_set_data(sqe, tag(conn, KPM_IOU_REQ_TYPE_READ));
 }
 
+static void worker_iou_handle_send(struct worker_state *self, struct io_uring_cqe *cqe)
+{
+	struct connection *conn;
+	int n;
+
+	if (!self->test)
+		return;
+
+	conn = untag(cqe->user_data);
+	self->iou_sends--;
+	assert(self->iou_sends >= 0);
+	n = cqe->res;
+
+	if (n < 0) {
+		warn("Send failed");
+		worker_kill_conn(self, conn);
+		return;
+	}
+
+	conn->to_send -= n;
+	conn->tot_sent += n;
+
+	if (!conn->to_send) {
+		worker_send_finished(self, conn, 0);
+		return;
+	} else {
+		worker_iou_send(self, conn, 1);
+	}
+}
+
 static void worker_iou_handle_recvzc(struct worker_state *self, struct io_uring_cqe *cqe)
 {
 	struct connection *conn;
@@ -1024,7 +1094,7 @@ static void worker_iou_handle_recvzc(struct worker_state *self, struct io_uring_
 	if (!conn->to_recv) {
 		worker_recv_finished(self, conn);
 		if (conn->to_send)
-			errx(1, "Unexpected to_send w/ recv");
+			worker_iou_send(self, conn, 1);
 	}
 
 	iou_zcrx_recycle(zcrx, cqe, rcqe);
@@ -1145,6 +1215,17 @@ worker_iou_prep(struct worker_state *self)
 	if (opts->zcrx)
 		ret = worker_iou_prep_recvzc(self, opts);
 
+	if (opts->send_zc) {
+		struct iovec iov = {
+			.iov_base = patbuf,
+			.iov_len = PATBUF_SZ,
+		};
+
+		ret = io_uring_register_buffers(&self->ring, &iov, 1);
+		if (ret < 0)
+			err(5, "Failed to register buffers");
+	}
+
 	struct kpm_state *state;
 	state = malloc(sizeof(*state));
 	memset(state, 0, sizeof(*state));
@@ -1176,6 +1257,8 @@ worker_iou_wait(struct worker_state *self)
 	io_uring_submit_and_wait_timeout(&self->ring, &cqe, 1, &timeout, NULL);
 
 	io_uring_for_each_cqe(&self->ring, head, cqe) {
+		if (cqe->flags & IORING_CQE_F_NOTIF)
+			goto next;
 		switch (get_tag(cqe->user_data)) {
 			case KPM_IOU_REQ_TYPE_MAIN:
 				worker_iou_handle_main_sock(self, cqe);
@@ -1186,10 +1269,14 @@ worker_iou_wait(struct worker_state *self)
 			case KPM_IOU_REQ_TYPE_RECVZC:
 				worker_iou_handle_recvzc(self, cqe);
 				break;
+			case KPM_IOU_REQ_TYPE_SEND:
+			case KPM_IOU_REQ_TYPE_SEND_ZC:
+				worker_iou_handle_send(self, cqe);
+				break;
 			default:
 				err(1, "Unknown io_uring request type: %d, res: %d", get_tag(cqe->user_data), cqe->res);
 		}
-
+next:
 		count++;
 	}
 	io_uring_cq_advance(&self->ring, count);
@@ -1198,9 +1285,6 @@ worker_iou_wait(struct worker_state *self)
 static void
 worker_iou_add_test(struct worker_state *self, struct connection *conn)
 {
-	if (conn->to_send)
-		errx(1, "io_uring doesn't support send yet");
-
 	if (self->iou_opts.zcrx) {
 		printf("----- add recvzc\n");
 		worker_iou_add_recvzc(&self->ring, conn);
@@ -1208,6 +1292,8 @@ worker_iou_add_test(struct worker_state *self, struct connection *conn)
 		printf("----- add recv\n");
 		worker_iou_add_recv(&self->ring, conn);
 	}
+	if (conn->to_send)
+		worker_iou_send(self, conn, 1);
 }
 
 static void
@@ -1238,6 +1324,11 @@ void NORETURN pworker_main(int fd, struct server_opts *opts)
 	struct worker_state self = { .main_sock = fd, };
 	unsigned char j;
 	int i, ret;
+	void *ptr;
+
+	if (posix_memalign(&ptr, 4096, PATBUF_SZ))
+		exit(0);
+	patbuf = ptr;
 
 	list_head_init(&self.connections);
 	self.memcmp = opts->memcmp;
@@ -1252,7 +1343,7 @@ void NORETURN pworker_main(int fd, struct server_opts *opts)
 	/* Initialize the data buffer we send/receive, it must match
 	 * on both ends, this is how we catch data corruption (ekhm kTLS..)
 	 */
-	for (i = 0, j = 0; i < (int)ARRAY_SIZE(patbuf); i++, j++) {
+	for (i = 0, j = 0; i < PATBUF_SZ; i++, j++) {
 		j = j ?: 1;
 		patbuf[i] = j;
 	}

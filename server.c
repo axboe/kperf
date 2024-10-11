@@ -73,6 +73,7 @@ static const struct opt_table opts[] = {
 	OPT_WITH_ARG("--iou_zcrx_pages", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_pages, "io_uring"),
 	OPT_WITH_ARG("--iou_zcrx_page_size", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_page_size, "io_uring"),
 	OPT_WITH_ARG("--iou_zcrx_queue_id", opt_set_ulongval, opt_show_ulongval, &opt.server_opts.iou_opts.zcrx_queue_id, "io_uring"),
+	OPT_WITHOUT_ARG("--iou_sendzc", opt_set_bool, &opt.server_opts.iou_opts.send_zc, "io_uring: Use zero copy Txx"),
  	OPT_ENDTABLE
 };
 
