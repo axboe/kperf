@@ -1256,6 +1256,7 @@ worker_iou_prep(struct worker_state *self)
 	io_uring_sqe_set_data(sqe, tag(state, KPM_IOU_REQ_TYPE_MAIN));
 
 	io_uring_enable_rings(&self->ring);
+	io_uring_register_ring_fd(&self->ring);
 	
 	return 0;
 }
